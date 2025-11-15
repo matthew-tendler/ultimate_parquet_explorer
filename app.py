@@ -54,8 +54,21 @@ use_full_for_heavy_ops = st.sidebar.checkbox(
 
 @st.cache_data(show_spinner=True)
 def load_parquet_from_bytes(file_bytes: bytes) -> pd.DataFrame:
-    """Load a Parquet file into a pandas DataFrame."""
-    return pd.read_parquet(BytesIO(file_bytes))
+    import pyarrow.parquet as pq
+    import pandas as pd
+    import io
+
+    # Read parquet with PyArrow
+    table = pq.read_table(io.BytesIO(file_bytes))
+
+    # Preserve true nulls and Arrow-native types
+    df = table.to_pandas(types_mapper=pd.ArrowDtype)
+
+    # Convert empty/whitespace-only strings to missing
+    df = df.replace(r"^\s*$", pd.NA, regex=True)
+
+    # Return cleaned dataframe
+    return df
 
 
 @st.cache_data(show_spinner=True)
