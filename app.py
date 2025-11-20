@@ -112,6 +112,111 @@ def get_categorical_columns(df: pd.DataFrame):
     return list(df.select_dtypes(include=["object", "category"]).columns)
 
 
+def extract_column_metadata(schema):
+    """
+    Extract SDTM/ADaM metadata (labels, formats) from PyArrow schema.
+    Returns a dict mapping column names to metadata dicts.
+    """
+    metadata_dict = {}
+    for field in schema:
+        col_meta = {}
+        field_meta = field.metadata or {}
+        
+        # Common metadata keys in SDTM/ADaM Parquet files
+        # Try various common keys for labels
+        label_keys = ["label", "Label", "LABEL", "description", "Description", "DESCRIPTION", "title", "Title"]
+        format_keys = ["format", "Format", "FORMAT", "fmt", "Fmt"]
+        unit_keys = ["unit", "Unit", "UNIT", "units", "Units"]
+        
+        for key in label_keys:
+            if key in field_meta:
+                # Metadata is stored as bytes, decode if needed
+                label_val = field_meta[key]
+                if isinstance(label_val, bytes):
+                    col_meta["label"] = label_val.decode("utf-8", errors="ignore")
+                else:
+                    col_meta["label"] = str(label_val)
+                break
+        
+        for key in format_keys:
+            if key in field_meta:
+                format_val = field_meta[key]
+                if isinstance(format_val, bytes):
+                    col_meta["format"] = format_val.decode("utf-8", errors="ignore")
+                else:
+                    col_meta["format"] = str(format_val)
+                break
+        
+        for key in unit_keys:
+            if key in field_meta:
+                unit_val = field_meta[key]
+                if isinstance(unit_val, bytes):
+                    col_meta["unit"] = unit_val.decode("utf-8", errors="ignore")
+                else:
+                    col_meta["unit"] = str(unit_val)
+                break
+        
+        # Also check if metadata is stored as JSON string
+        if not col_meta.get("label") and "pandas" in field_meta:
+            try:
+                import json
+                pandas_meta = json.loads(field_meta["pandas"].decode("utf-8") if isinstance(field_meta["pandas"], bytes) else field_meta["pandas"])
+                if "column_name" in pandas_meta and "metadata" in pandas_meta:
+                    meta = pandas_meta.get("metadata", {})
+                    if "label" in meta:
+                        col_meta["label"] = meta["label"]
+                    if "format" in meta:
+                        col_meta["format"] = meta["format"]
+            except:
+                pass
+        
+        metadata_dict[field.name] = col_meta
+    
+    return metadata_dict
+
+
+def is_id_variable(col_name: str, metadata: dict = None) -> bool:
+    """
+    Identify ID variables that shouldn't be summarized.
+    Checks column name patterns and metadata.
+    """
+    col_upper = col_name.upper()
+    
+    # Common ID variable patterns
+    id_patterns = [
+        col_upper.endswith("ID"),
+        col_upper.endswith("IDN"),
+        col_upper.endswith("_ID"),
+        col_upper.endswith("_IDN"),
+        col_upper in ["SITEID", "SITEGR1", "TRTPN", "USUBJID", "SUBJID"],
+        "ID" in col_upper and any(x in col_upper for x in ["SITE", "SUBJ", "PAT", "TRT"]),
+    ]
+    
+    # Check metadata for hints
+    if metadata:
+        label = metadata.get("label", "").upper()
+        if "ID" in label and any(x in label for x in ["IDENTIFIER", "IDENTIFICATION", "ID NUMBER"]):
+            return True
+    
+    return any(id_patterns)
+
+
+def get_numeric_columns_excluding_ids(df: pd.DataFrame, column_metadata: dict = None):
+    """
+    Get numeric columns, excluding ID variables.
+    """
+    numeric_cols = get_numeric_columns(df)
+    if column_metadata is None:
+        column_metadata = {}
+    
+    # Filter out ID variables
+    filtered_cols = [
+        col for col in numeric_cols 
+        if not is_id_variable(col, column_metadata.get(col, {}))
+    ]
+    return filtered_cols
+
+
 # ---------------------------
 # Main content
 # ---------------------------
@@ -123,6 +228,7 @@ else:
     file_bytes = uploaded_file.read()
     full_df = load_parquet_from_bytes(file_bytes)
     schema = load_schema_from_bytes(file_bytes)
+    column_metadata = extract_column_metadata(schema)
     sample_df = get_sample(full_df, sample_size)
     profile_df = profile_dataframe(sample_df)
 
@@ -147,24 +253,47 @@ else:
     # Tab 1 - Schema & Overview
     # ---------------------------
     with tab_overview:
-        st.subheader("Schema")
+        st.subheader("Schema with SDTM/ADaM Metadata")
         schema_rows = []
         for field in schema:
+            meta = column_metadata.get(field.name, {})
+            is_id = is_id_variable(field.name, meta)
             schema_rows.append(
                 {
                     "column": field.name,
+                    "label": meta.get("label", ""),
+                    "format": meta.get("format", ""),
+                    "unit": meta.get("unit", ""),
                     "arrow_type": str(field.type),
                     "nullable": field.nullable,
-                    "metadata": dict(field.metadata or {}),
+                    "is_id_variable": "Yes" if is_id else "No",
                 }
             )
         schema_df = pd.DataFrame(schema_rows)
 
-        st.write("PyArrow schema:")
+        # Display schema with metadata prominently
         st.dataframe(schema_df, use_container_width=True)
+        
+        # Show raw metadata if available
+        has_metadata = any(column_metadata.values())
+        if has_metadata:
+            st.success(f"✓ Found metadata (labels/formats) for {sum(1 for m in column_metadata.values() if m)} columns")
+        else:
+            st.info("ℹ️ No variable labels or formats found in metadata. If your Parquet file contains SDTM/ADaM metadata, it should appear above.")
 
         st.subheader("Column profiling (sample-based)")
-        st.dataframe(profile_df, use_container_width=True)
+        # Enhance profile with labels
+        profile_enhanced = profile_df.copy()
+        profile_enhanced["label"] = profile_enhanced["column"].map(
+            lambda x: column_metadata.get(x, {}).get("label", "")
+        )
+        profile_enhanced["is_id"] = profile_enhanced["column"].map(
+            lambda x: is_id_variable(x, column_metadata.get(x, {}))
+        )
+        # Reorder columns to show label early
+        cols_order = ["column", "label", "is_id", "dtype", "non_null_count", "missing_count", "missing_percent", "unique_count"]
+        profile_enhanced = profile_enhanced[cols_order]
+        st.dataframe(profile_enhanced, use_container_width=True)
 
     # ---------------------------
     # Tab 2 - Table Explorer (AG Grid)
@@ -234,24 +363,37 @@ else:
         if len(viz_df) == 0:
             st.warning("No data available for visualization.")
         else:
+            # Create display names with labels for better UX
+            def get_col_display_name(col):
+                label = column_metadata.get(col, {}).get("label", "")
+                if label:
+                    return f"{col} ({label})"
+                return col
+            
+            col_display_map = {get_col_display_name(col): col for col in viz_df.columns}
+            col_display_options = list(col_display_map.keys())
+            
             col1, col2, col3 = st.columns(3)
 
             with col1:
-                x_col = st.selectbox("X axis", options=list(viz_df.columns), index=0)
+                x_display = st.selectbox("X axis", options=col_display_options, index=0)
+                x_col = col_display_map[x_display]
 
             with col2:
-                y_col = st.selectbox(
+                y_display = st.selectbox(
                     "Y axis (optional, often numeric)",
-                    options=["(none)"] + list(viz_df.columns),
+                    options=["(none)"] + col_display_options,
                     index=0,
                 )
+                y_col = col_display_map[y_display] if y_display != "(none)" else None
 
             with col3:
-                color_col = st.selectbox(
+                color_display = st.selectbox(
                     "Color (optional, often categorical)",
-                    options=["(none)"] + list(viz_df.columns),
+                    options=["(none)"] + col_display_options,
                     index=0,
                 )
+                color_col = col_display_map[color_display] if color_display != "(none)" else None
 
             chart_type = st.selectbox(
                 "Chart type",
@@ -261,32 +403,46 @@ else:
 
             if st.button("Create chart"):
                 plot_kwargs = {}
-                if y_col != "(none)":
+                if y_col:
                     plot_kwargs["y"] = y_col
-                if color_col != "(none)":
+                if color_col:
                     plot_kwargs["color"] = color_col
 
                 try:
+                    # Get labels for axis titles
+                    x_label = column_metadata.get(x_col, {}).get("label", x_col)
+                    labels_dict = {x_col: x_label}
+                    if y_col:
+                        y_label = column_metadata.get(y_col, {}).get("label", y_col)
+                        labels_dict[y_col] = y_label
+                    if color_col:
+                        color_label = column_metadata.get(color_col, {}).get("label", color_col)
+                        labels_dict[color_col] = color_label
+                    
                     if chart_type == "Histogram":
-                        fig = px.histogram(viz_df, x=x_col, **plot_kwargs)
+                        fig = px.histogram(viz_df, x=x_col, **plot_kwargs, labels=labels_dict)
                     elif chart_type == "Boxplot":
-                        fig = px.box(viz_df, x=x_col, **plot_kwargs)
+                        fig = px.box(viz_df, x=x_col, **plot_kwargs, labels=labels_dict)
                     elif chart_type == "Scatter":
-                        if y_col == "(none)":
+                        if not y_col:
                             st.error("Scatter plot requires a Y axis.")
                             fig = None
                         else:
-                            fig = px.scatter(viz_df, x=x_col, **plot_kwargs)
+                            fig = px.scatter(viz_df, x=x_col, **plot_kwargs, labels=labels_dict)
                     elif chart_type == "Bar":
-                        if y_col == "(none)":
+                        if not y_col:
                             # Count by category
+                            bar_labels = {x_col: x_label}
+                            if color_col:
+                                bar_labels[color_col] = column_metadata.get(color_col, {}).get("label", color_col)
                             fig = px.bar(
                                 viz_df,
                                 x=x_col,
-                                color=color_col if color_col != "(none)" else None,
+                                color=color_col,
+                                labels=bar_labels
                             )
                         else:
-                            fig = px.bar(viz_df, x=x_col, **plot_kwargs)
+                            fig = px.bar(viz_df, x=x_col, **plot_kwargs, labels=labels_dict)
                     else:
                         fig = None
 
@@ -302,16 +458,42 @@ else:
         st.subheader("Summary Statistics")
 
         stats_df_source = full_df if use_full_for_heavy_ops else sample_df
-        numeric_cols = get_numeric_columns(stats_df_source)
+        all_numeric_cols = get_numeric_columns(stats_df_source)
+        # Exclude ID variables by default
+        numeric_cols = get_numeric_columns_excluding_ids(stats_df_source, column_metadata)
+        id_numeric_cols = [col for col in all_numeric_cols if col not in numeric_cols]
 
-        if not numeric_cols:
+        if not all_numeric_cols:
             st.warning("No numeric columns found for summary statistics.")
         else:
-            selected_cols = st.multiselect(
+            if id_numeric_cols:
+                st.info(
+                    f"ℹ️ Excluded {len(id_numeric_cols)} ID variable(s) from default selection: "
+                    f"{', '.join(id_numeric_cols[:5])}"
+                    + (f" and {len(id_numeric_cols) - 5} more" if len(id_numeric_cols) > 5 else "")
+                    + ". ID variables (like SITEID, TRTPN) are typically not meaningful to summarize."
+                )
+            
+            # Create display names with labels
+            def get_col_display_name(col):
+                label = column_metadata.get(col, {}).get("label", "")
+                if label:
+                    return f"{col} ({label})"
+                return col
+            
+            display_options = {get_col_display_name(col): col for col in all_numeric_cols}
+            
+            default_selected = numeric_cols[: min(5, len(numeric_cols))] if numeric_cols else []
+            default_selected_display = [get_col_display_name(col) for col in default_selected]
+            
+            selected_display = st.multiselect(
                 "Numeric columns to summarize",
-                options=numeric_cols,
-                default=numeric_cols[: min(5, len(numeric_cols))],
+                options=list(display_options.keys()),
+                default=default_selected_display,
+                help="ID variables are excluded by default. Select from all numeric columns if needed.",
             )
+            
+            selected_cols = [display_options[disp] for disp in selected_display]
 
             group_cols = st.multiselect(
                 "Group by (categorical columns)",
