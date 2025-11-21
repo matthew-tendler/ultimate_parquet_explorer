@@ -49,24 +49,6 @@ if use_sample_data:
 if uploaded_file is not None:
     st.session_state.use_sample_data = False
 
-sample_size = st.sidebar.number_input(
-    "Sample size for exploration",
-    min_value=100,
-    max_value=100_000,
-    value=5_000,
-    step=500,
-    help="The app will use up to this many rows for previews and visualizations.",
-)
-
-use_full_for_heavy_ops = st.sidebar.checkbox(
-    "Use full dataset for heavy operations (summary stats, crosstabs)",
-    value=False,
-    help=(
-        "If checked, some operations will run on the full dataset instead of the sample. "
-        "This may be slower for large files."
-    ),
-)
-
 
 # ---------------------------
 # Helper functions
@@ -96,13 +78,6 @@ def load_schema_from_bytes(file_bytes: bytes):
     """Return a PyArrow schema from Parquet bytes."""
     pf = pq.ParquetFile(BytesIO(file_bytes))
     return pf.schema_arrow
-
-
-def get_sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    """Return a sampled DataFrame, respecting row count."""
-    if len(df) <= n:
-        return df
-    return df.sample(n=n, random_state=0)
 
 
 def profile_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -271,8 +246,7 @@ else:
     full_df = load_parquet_from_bytes(file_bytes)
     schema = load_schema_from_bytes(file_bytes)
     column_metadata = extract_column_metadata(schema)
-    sample_df = get_sample(full_df, sample_size)
-    profile_df = profile_dataframe(sample_df)
+    profile_df = profile_dataframe(full_df)
 
     st.success(
         f"Loaded dataset with approximately {len(full_df):,} rows and {len(full_df.columns)} columns."
@@ -280,14 +254,13 @@ else:
     )
 
     # Tabs
-    tab_overview, tab_table, tab_filter, tab_viz, tab_stats, tab_crosstab, tab_missing = st.tabs(
+    tab_overview, tab_table, tab_filter, tab_viz, tab_stats, tab_missing = st.tabs(
         [
             "Schema & Overview",
             "Table Explorer",
             "Filters",
             "Visualizations",
             "Summary Stats",
-            "Crosstabs",
             "Missing Data",
         ]
     )
@@ -324,7 +297,7 @@ else:
         else:
             st.info("ℹ️ No variable labels or formats found in metadata. If your Parquet file contains SDTM/ADaM metadata, it should appear above.")
 
-        st.subheader("Column profiling (sample-based)")
+        st.subheader("Column profiling")
         # Enhance profile with labels
         profile_enhanced = profile_df.copy()
         profile_enhanced["label"] = profile_enhanced["column"].map(
@@ -342,32 +315,31 @@ else:
     # Tab 2 - Table Explorer (AG Grid)
     # ---------------------------
     with tab_table:
-        st.subheader("Table Explorer (sample)")
+        st.subheader("Table Explorer")
         st.caption(
-            "Showing a sampled subset for responsiveness. Adjust sample size in the sidebar. "
             "Select specific columns below to improve readability when viewing many columns."
         )
 
         # Column selection for better readability
         if "table_selected_columns" not in st.session_state:
             # Default to first 15 columns for readability
-            st.session_state.table_selected_columns = list(sample_df.columns)[:min(15, len(sample_df.columns))]
+            st.session_state.table_selected_columns = list(full_df.columns)[:min(15, len(full_df.columns))]
         
         col_select_col1, col_select_col2, col_select_col3 = st.columns([4, 1, 1])
         with col_select_col1:
             selected_columns = st.multiselect(
                 "Select columns to display (helps with readability when you have many columns)",
-                options=list(sample_df.columns),
+                options=list(full_df.columns),
                 default=st.session_state.table_selected_columns,
                 help="Select which columns to display in the table. This helps improve readability when you have many columns.",
             )
         with col_select_col2:
             if st.button("All", use_container_width=True):
-                st.session_state.table_selected_columns = list(sample_df.columns)
+                st.session_state.table_selected_columns = list(full_df.columns)
                 st.rerun()
         with col_select_col3:
             if st.button("Reset", use_container_width=True):
-                st.session_state.table_selected_columns = list(sample_df.columns)[:min(15, len(sample_df.columns))]
+                st.session_state.table_selected_columns = list(full_df.columns)[:min(15, len(full_df.columns))]
                 st.rerun()
         
         # Update session state
@@ -377,7 +349,7 @@ else:
         if not selected_columns:
             st.info("Select at least one column to display.")
         else:
-            display_df = sample_df[selected_columns].copy()
+            display_df = full_df[selected_columns].copy()
             
             # Configure AG Grid with better column sizing
             gb = GridOptionsBuilder.from_dataframe(display_df)
@@ -451,11 +423,9 @@ else:
 
         filter_expr = st.text_input("Filter expression", value="", placeholder="e.g. AGE > 50 and SEX == 'F'")
 
-        target_df = full_df if use_full_for_heavy_ops else sample_df
-
         if filter_expr:
             try:
-                filtered_df = target_df.query(filter_expr)
+                filtered_df = full_df.query(filter_expr)
                 st.success(f"Filter applied, {len(filtered_df):,} rows match.")
                 st.dataframe(filtered_df.head(100), use_container_width=True)
                 st.caption("Showing first 100 rows of filtered data.")
@@ -470,7 +440,7 @@ else:
     with tab_viz:
         st.subheader("Visual Builder")
 
-        viz_df = sample_df  # keep visuals responsive
+        viz_df = full_df
 
         numeric_cols = get_numeric_columns(viz_df)
         cat_cols = get_categorical_columns(viz_df)
@@ -572,10 +542,9 @@ else:
     with tab_stats:
         st.subheader("Summary Statistics")
 
-        stats_df_source = full_df if use_full_for_heavy_ops else sample_df
-        all_numeric_cols = get_numeric_columns(stats_df_source)
+        all_numeric_cols = get_numeric_columns(full_df)
         # Exclude ID variables by default
-        numeric_cols = get_numeric_columns_excluding_ids(stats_df_source, column_metadata)
+        numeric_cols = get_numeric_columns_excluding_ids(full_df, column_metadata)
         id_numeric_cols = [col for col in all_numeric_cols if col not in numeric_cols]
 
         if not all_numeric_cols:
@@ -612,18 +581,18 @@ else:
 
             group_cols = st.multiselect(
                 "Group by (categorical columns)",
-                options=get_categorical_columns(stats_df_source),
+                options=get_categorical_columns(full_df),
                 default=[],
             )
 
             if selected_cols:
                 if group_cols:
-                    grouped = stats_df_source.groupby(group_cols)[selected_cols]
+                    grouped = full_df.groupby(group_cols)[selected_cols]
                     stats_df = grouped.agg(
                         ["mean", "median", "std", "min", "max", "count"]
                     )
                 else:
-                    stats_df = stats_df_source[selected_cols].agg(
+                    stats_df = full_df[selected_cols].agg(
                         ["mean", "median", "std", "min", "max", "count"]
                     )
                 st.dataframe(stats_df, use_container_width=True)
@@ -631,45 +600,18 @@ else:
                 st.info("Select at least one numeric column to summarize.")
 
     # ---------------------------
-    # Tab 6 - Crosstabs
-    # ---------------------------
-    with tab_crosstab:
-        st.subheader("Crosstab Builder")
-
-        crosstab_df_source = full_df if use_full_for_heavy_ops else sample_df
-        cat_cols = get_categorical_columns(crosstab_df_source)
-
-        if len(cat_cols) < 2:
-            st.warning("Need at least two categorical columns for crosstabs.")
-        else:
-            row_cat = st.selectbox("Row category", options=cat_cols)
-            col_cat = st.selectbox("Column category", options=[c for c in cat_cols if c != row_cat])
-
-            if row_cat and col_cat:
-                ct = pd.crosstab(
-                    crosstab_df_source[row_cat],
-                    crosstab_df_source[col_cat],
-                    dropna=False,
-                    margins=True,
-                    margins_name="Total",
-                )
-                st.dataframe(ct, use_container_width=True)
-
-    # ---------------------------
-    # Tab 7 - Missing Data
+    # Tab 6 - Missing Data
     # ---------------------------
     with tab_missing:
         st.subheader("Missing Data Overview")
 
-        missing_df_source = full_df if use_full_for_heavy_ops else sample_df
-
-        missing_counts = missing_df_source.isna().sum()
-        missing_percents = missing_df_source.isna().mean() * 100.0
+        missing_counts = full_df.isna().sum()
+        missing_percents = full_df.isna().mean() * 100.0
         missing_summary = pd.DataFrame(
             {
                 "missing_count": missing_counts,
                 "missing_percent": missing_percents,
-                "dtype": missing_df_source.dtypes,
+                "dtype": full_df.dtypes,
             }
         )
         missing_summary = missing_summary[missing_summary["missing_count"] > 0].sort_values(
@@ -677,22 +619,28 @@ else:
         )
 
         if missing_summary.empty:
-            st.success("No missing data found in the dataset/sample.")
+            st.success("No missing data found in the dataset.")
         else:
             st.dataframe(missing_summary, use_container_width=True)
 
-            try:
-                import seaborn as sns
-                import matplotlib.pyplot as plt
-
-                fig, ax = plt.subplots(figsize=(10, 6))
-                sns.heatmap(
-                    missing_df_source.isna(),
-                    cbar=False,
-                    yticklabels=False,
-                    ax=ax,
-                    cmap="viridis",
-                )
-                st.pyplot(fig)
-            except ImportError:
-                st.info("Install seaborn and matplotlib to see missing data heatmap visualization.")
+            # Create missing data heatmap using Plotly
+            missing_matrix = full_df.isna().astype(int)
+            
+            # Sample the data if too large for visualization (limit to 1000 rows for performance)
+            if len(missing_matrix) > 1000:
+                missing_matrix_sample = missing_matrix.sample(n=1000, random_state=0)
+                st.caption(f"Showing heatmap for 1,000 randomly sampled rows (out of {len(missing_matrix):,} total rows)")
+            else:
+                missing_matrix_sample = missing_matrix
+            
+            fig = px.imshow(
+                missing_matrix_sample.T,
+                labels=dict(x="Row", y="Column", color="Missing"),
+                x=[f"Row {i+1}" for i in range(len(missing_matrix_sample))],
+                y=missing_matrix_sample.columns.tolist(),
+                color_continuous_scale="Viridis",
+                aspect="auto",
+                title="Missing Data Heatmap (Yellow = Missing, Purple = Present)"
+            )
+            fig.update_layout(height=max(400, len(missing_matrix_sample.columns) * 20))
+            st.plotly_chart(fig, use_container_width=True)
