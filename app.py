@@ -4,6 +4,7 @@ import pyarrow.parquet as pq
 from io import BytesIO
 import plotly.express as px
 from st_aggrid import AgGrid, GridOptionsBuilder
+import re
 
 
 st.set_page_config(
@@ -212,6 +213,138 @@ def get_numeric_columns_excluding_ids(df: pd.DataFrame, column_metadata: dict = 
     return filtered_cols
 
 
+def convert_sas_where_to_pandas(sas_expr: str) -> str:
+    """
+    Convert SAS WHERE syntax to pandas.query compatible syntax.
+    
+    Examples:
+    - AGE > 50 AND SEX = 'F' -> AGE > 50 and SEX == 'F'
+    - ARMCD IN ('A', 'B') -> ARMCD in ['A', 'B']
+    """
+    expr = sas_expr.strip()
+    
+    # Handle string comparisons: SEX = 'F' -> SEX == 'F'
+    # Match: column = 'value' or column = "value"
+    expr = re.sub(r'(\w+)\s*=\s*(["\'])([^"\']+)\2', r'\1 == \2\3\2', expr)
+    
+    # Handle numeric comparisons: AGE = 50 -> AGE == 50
+    # Match: column = number (not already ==)
+    expr = re.sub(r'(\w+)\s*=\s*(\d+(?:\.\d+)?)(?![=<>])', r'\1 == \2', expr)
+    
+    # Handle IN: ARMCD IN ('A', 'B') -> ARMCD in ['A', 'B']
+    def replace_in(match):
+        col = match.group(1)
+        values = match.group(2)
+        # Replace single quotes with double quotes and wrap in brackets
+        values_list = values.replace("'", '"').replace('"', '"')
+        return f"{col} in [{values_list}]"
+    
+    expr = re.sub(r'(\w+)\s+IN\s+\(([^)]+)\)', replace_in, expr, flags=re.IGNORECASE)
+    
+    # Handle AND/OR (ensure proper spacing and lowercase)
+    expr = re.sub(r'\s+AND\s+', ' and ', expr, flags=re.IGNORECASE)
+    expr = re.sub(r'\s+OR\s+', ' or ', expr, flags=re.IGNORECASE)
+    expr = re.sub(r'\s+NOT\s+', ' not ', expr, flags=re.IGNORECASE)
+    
+    return expr
+
+
+def convert_r_dplyr_to_pandas(r_expr: str) -> str:
+    """
+    Convert R dplyr filter syntax to pandas.query compatible syntax.
+    
+    Examples:
+    - age > 50 & sex == 'F' -> age > 50 and sex == 'F'
+    - armcd %in% c('A', 'B') -> armcd in ['A', 'B']
+    """
+    expr = r_expr.strip()
+    
+    # Replace R operators with Python equivalents
+    expr = re.sub(r'\s+&\s+', ' and ', expr)
+    expr = re.sub(r'\s+\|\s+', ' or ', expr)
+    expr = re.sub(r'!\s*(\w+)', r'not \1', expr)
+    
+    # Handle %in%: armcd %in% c('A', 'B') -> armcd in ['A', 'B']
+    def replace_in_r(match):
+        col = match.group(1)
+        values = match.group(2)
+        # Replace single quotes with double quotes and wrap in brackets
+        values_list = values.replace("'", '"').replace('"', '"')
+        return f"{col} in [{values_list}]"
+    
+    expr = re.sub(r'(\w+)\s*%in%\s*c\(([^)]+)\)', replace_in_r, expr, flags=re.IGNORECASE)
+    
+    return expr
+
+
+def build_pandas_query_from_conditions(conditions: list, df: pd.DataFrame) -> str:
+    """
+    Build a pandas query string from visual filter conditions.
+    
+    Args:
+        conditions: List of dicts with keys: column, operator, value, logic
+        df: DataFrame to get column types from
+    
+    Returns:
+        pandas query string
+    """
+    if not conditions:
+        return ""
+    
+    query_parts = []
+    
+    for i, cond in enumerate(conditions):
+        col = cond.get('column', '')
+        operator = cond.get('operator', '=')
+        value = cond.get('value', '')
+        logic = cond.get('logic', 'AND')
+        
+        if operator in ['IS NULL', 'IS NOT NULL']:
+            # Handle NULL checks
+            if operator == 'IS NULL':
+                query_parts.append(f"{col}.isna()")
+            elif operator == 'IS NOT NULL':
+                query_parts.append(f"{col}.notna()")
+        elif col:
+            # Get column dtype to determine value handling
+            col_dtype = str(df[col].dtype) if col in df.columns else 'object'
+            is_numeric = 'int' in col_dtype or 'float' in col_dtype
+            
+            # Build condition based on operator
+            if operator == '=':
+                if is_numeric:
+                    query_parts.append(f"{col} == {value}")
+                else:
+                    # String value needs quotes
+                    value_clean = value.replace("'", "\\'").replace('"', '\\"')
+                    query_parts.append(f"{col} == '{value_clean}'")
+            elif operator == '!=':
+                if is_numeric:
+                    query_parts.append(f"{col} != {value}")
+                else:
+                    value_clean = value.replace("'", "\\'").replace('"', '\\"')
+                    query_parts.append(f"{col} != '{value_clean}'")
+            elif operator in ['>', '>=', '<', '<=']:
+                query_parts.append(f"{col} {operator} {value}")
+            elif operator == 'IN':
+                # Parse comma-separated values
+                values = [v.strip().strip("'\"") for v in value.split(',')]
+                if is_numeric:
+                    query_parts.append(f"{col} in [{', '.join(values)}]")
+                else:
+                    values_quoted = [f"'{v.replace(chr(39), chr(39)+chr(39))}'" for v in values]
+                    query_parts.append(f"{col} in [{', '.join(values_quoted)}]")
+            elif operator == 'CONTAINS':
+                value_clean = value.replace("'", "\\'").replace('"', '\\"')
+                query_parts.append(f"{col}.str.contains('{value_clean}', na=False)")
+        
+        # Add logic operator between conditions (except for last one)
+        if i < len(conditions) - 1:
+            query_parts.append(logic.lower())
+    
+    return ' '.join(query_parts)
+
+
 # ---------------------------
 # Main content
 # ---------------------------
@@ -409,30 +542,208 @@ else:
             st.caption(f"Displaying {len(display_df):,} rows × {len(display_df.columns)} columns. Use column filters and sorting to explore the data.")
 
     # ---------------------------
-    # Tab 3 - Filters (Expression-based)
+    # Tab 3 - Filters
     # ---------------------------
     with tab_filter:
-        st.subheader("Expression Filters (pandas.query style)")
-        st.write(
-            "Enter a filter expression using pandas.query syntax. "
-            "Examples:\n\n"
-            "`AGE > 50`\n\n"
-            "`SEX == 'F' and AGE >= 18`\n\n"
-            "`ARMCD in ['A', 'B']`"
+        st.subheader("Data Filters")
+        
+        # Initialize filter conditions in session state
+        if "filter_conditions" not in st.session_state:
+            st.session_state.filter_conditions = []
+        
+        filter_mode = st.radio(
+            "Filter mode",
+            options=["Visual Builder", "Expression (SAS/R/Python)"],
+            horizontal=True,
+            help="Choose between a visual form-based builder or write expressions in your preferred syntax"
         )
-
-        filter_expr = st.text_input("Filter expression", value="", placeholder="e.g. AGE > 50 and SEX == 'F'")
-
-        if filter_expr:
-            try:
-                filtered_df = full_df.query(filter_expr)
-                st.success(f"Filter applied, {len(filtered_df):,} rows match.")
-                st.dataframe(filtered_df.head(100), use_container_width=True)
-                st.caption("Showing first 100 rows of filtered data.")
-            except Exception as e:
-                st.error(f"Could not apply filter: {e}")
-        else:
-            st.info("Enter a filter expression to see filtered results.")
+        
+        if filter_mode == "Visual Builder":
+            st.write("**Build filters using the form below. Click 'Add Condition' to add more filters.**")
+            
+            # Display existing conditions
+            if st.session_state.filter_conditions:
+                st.write("**Current Filters:**")
+                for i, condition in enumerate(st.session_state.filter_conditions):
+                    with st.container():
+                        col1, col2, col3, col4, col5 = st.columns([3, 2, 3, 1.5, 0.5])
+                        
+                        with col1:
+                            # Get column display names with labels
+                            def get_col_display_name(col):
+                                label = column_metadata.get(col, {}).get("label", "")
+                                if label:
+                                    return f"{col} ({label})"
+                                return col
+                            
+                            col_display_map = {get_col_display_name(col): col for col in full_df.columns}
+                            col_display_options = list(col_display_map.keys())
+                            
+                            current_col_display = get_col_display_name(condition.get('column', full_df.columns[0]))
+                            if current_col_display not in col_display_options:
+                                current_col_display = col_display_options[0]
+                            
+                            selected_col_display = st.selectbox(
+                                "Column",
+                                options=col_display_options,
+                                index=col_display_options.index(current_col_display) if current_col_display in col_display_options else 0,
+                                key=f"filter_col_{i}",
+                                label_visibility="collapsed"
+                            )
+                            condition['column'] = col_display_map[selected_col_display]
+                        
+                        with col2:
+                            operator = st.selectbox(
+                                "Operator",
+                                options=["=", "!=", ">", ">=", "<", "<=", "IN", "CONTAINS", "IS NULL", "IS NOT NULL"],
+                                index=["=", "!=", ">", ">=", "<", "<=", "IN", "CONTAINS", "IS NULL", "IS NOT NULL"].index(condition.get('operator', '=')),
+                                key=f"filter_op_{i}",
+                                label_visibility="collapsed"
+                            )
+                            condition['operator'] = operator
+                        
+                        with col3:
+                            if operator not in ["IS NULL", "IS NOT NULL"]:
+                                value = st.text_input(
+                                    "Value",
+                                    value=condition.get('value', ''),
+                                    key=f"filter_val_{i}",
+                                    placeholder="Enter value or comma-separated list for IN",
+                                    label_visibility="collapsed"
+                                )
+                                condition['value'] = value
+                            else:
+                                st.write("")  # Empty space for alignment
+                        
+                        with col4:
+                            if i < len(st.session_state.filter_conditions) - 1:
+                                logic = st.selectbox(
+                                    "Logic",
+                                    options=["AND", "OR"],
+                                    index=0 if condition.get('logic', 'AND') == 'AND' else 1,
+                                    key=f"filter_logic_{i}",
+                                    label_visibility="collapsed"
+                                )
+                                condition['logic'] = logic
+                            else:
+                                st.write("")  # Empty space for last condition
+                        
+                        with col5:
+                            if st.button("🗑️", key=f"filter_remove_{i}", help="Remove this condition"):
+                                st.session_state.filter_conditions.pop(i)
+                                st.rerun()
+            
+            # Add new condition button
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                if st.button("➕ Add Condition", use_container_width=True):
+                    st.session_state.filter_conditions.append({
+                        'column': full_df.columns[0],
+                        'operator': '=',
+                        'value': '',
+                        'logic': 'AND'
+                    })
+                    st.rerun()
+            
+            # Clear all and apply buttons
+            col1, col2, col3 = st.columns([1, 1, 2])
+            with col1:
+                if st.button("Clear All", use_container_width=True):
+                    st.session_state.filter_conditions = []
+                    st.rerun()
+            
+            with col2:
+                apply_visual = st.button("Apply Filters", type="primary", use_container_width=True)
+            
+            # Apply visual filters
+            if apply_visual and st.session_state.filter_conditions:
+                try:
+                    # Validate conditions have values (except for NULL checks)
+                    valid_conditions = []
+                    for cond in st.session_state.filter_conditions:
+                        if cond['operator'] in ['IS NULL', 'IS NOT NULL']:
+                            valid_conditions.append(cond)
+                        elif cond.get('value', '').strip():
+                            valid_conditions.append(cond)
+                    
+                    if valid_conditions:
+                        pandas_query = build_pandas_query_from_conditions(valid_conditions, full_df)
+                        filtered_df = full_df.query(pandas_query)
+                        st.success(f"✅ Filter applied! {len(filtered_df):,} rows match (out of {len(full_df):,} total).")
+                        st.code(f"Generated query: {pandas_query}", language="python")
+                        st.dataframe(filtered_df.head(100), use_container_width=True)
+                        st.caption(f"Showing first 100 rows of {len(filtered_df):,} filtered rows.")
+                    else:
+                        st.warning("⚠️ Please add at least one valid filter condition.")
+                except Exception as e:
+                    st.error(f"❌ Could not apply filter: {e}")
+                    st.info("💡 Tip: Make sure values match the column data type (numbers for numeric columns, text for text columns).")
+            elif apply_visual:
+                st.info("ℹ️ Add at least one filter condition to apply filters.")
+        
+        else:  # Expression mode
+            syntax_type = st.selectbox(
+                "Syntax type",
+                options=["SAS WHERE", "R dplyr", "Python pandas"],
+                help="Choose the syntax you're most comfortable with"
+            )
+            
+            if syntax_type == "SAS WHERE":
+                st.write("""
+                **SAS WHERE Syntax Examples:**
+                - `AGE > 50 AND SEX = 'F'`
+                - `ARMCD IN ('A', 'B')`
+                - `AGE >= 18 AND (SEX = 'M' OR SEX = 'F')`
+                - `AVAL IS NOT NULL`
+                """)
+                placeholder = "e.g. AGE > 50 AND SEX = 'F'"
+            elif syntax_type == "R dplyr":
+                st.write("""
+                **R dplyr Syntax Examples:**
+                - `age > 50 & sex == 'F'`
+                - `armcd %in% c('A', 'B')`
+                - `age >= 18 & (sex == 'M' | sex == 'F')`
+                - `!is.na(aval)`
+                """)
+                placeholder = "e.g. age > 50 & sex == 'F'"
+            else:  # Python pandas
+                st.write("""
+                **Python pandas.query Syntax Examples:**
+                - `AGE > 50 and SEX == 'F'`
+                - `ARMCD in ['A', 'B']`
+                - `AGE >= 18 and (SEX == 'M' or SEX == 'F')`
+                - `AVAL.notna()`
+                """)
+                placeholder = "e.g. AGE > 50 and SEX == 'F'"
+            
+            filter_expr = st.text_input(
+                "Filter expression", 
+                value="", 
+                placeholder=placeholder,
+                help="Enter your filter expression using the selected syntax"
+            )
+            
+            if filter_expr:
+                try:
+                    # Convert to pandas query syntax if needed
+                    if syntax_type == "SAS WHERE":
+                        pandas_expr = convert_sas_where_to_pandas(filter_expr)
+                        st.caption(f"Converted to pandas: `{pandas_expr}`")
+                    elif syntax_type == "R dplyr":
+                        pandas_expr = convert_r_dplyr_to_pandas(filter_expr)
+                        st.caption(f"Converted to pandas: `{pandas_expr}`")
+                    else:
+                        pandas_expr = filter_expr
+                    
+                    filtered_df = full_df.query(pandas_expr)
+                    st.success(f"✅ Filter applied! {len(filtered_df):,} rows match (out of {len(full_df):,} total).")
+                    st.dataframe(filtered_df.head(100), use_container_width=True)
+                    st.caption(f"Showing first 100 rows of {len(filtered_df):,} filtered rows.")
+                except Exception as e:
+                    st.error(f"❌ Could not apply filter: {e}")
+                    st.info("💡 Tip: Check your syntax. Column names are case-sensitive. For SAS/R syntax, make sure operators and values are correctly formatted.")
+            else:
+                st.info("ℹ️ Enter a filter expression to see filtered results.")
 
     # ---------------------------
     # Tab 4 - Visualizations (Plotly)
