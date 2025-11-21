@@ -24,10 +24,30 @@ st.write(
 
 st.sidebar.header("Data Input")
 
+# Add sample data option
+use_sample_data = st.sidebar.button(
+    "📊 Load Sample Data",
+    help="Load the sample ADaM dataset (adadas.parquet) to explore the app without uploading your own file.",
+    use_container_width=True,
+)
+
 uploaded_file = st.sidebar.file_uploader(
     "Upload a Parquet file",
     type=["parquet"],
+    help="Upload your own parquet file, or use the sample data button above to try the app.",
 )
+
+# Initialize session state for sample data
+if "use_sample_data" not in st.session_state:
+    st.session_state.use_sample_data = False
+
+# Handle sample data button click
+if use_sample_data:
+    st.session_state.use_sample_data = True
+
+# If user uploads a file, switch off sample data
+if uploaded_file is not None:
+    st.session_state.use_sample_data = False
 
 sample_size = st.sidebar.number_input(
     "Sample size for exploration",
@@ -221,11 +241,33 @@ def get_numeric_columns_excluding_ids(df: pd.DataFrame, column_metadata: dict = 
 # Main content
 # ---------------------------
 
-if uploaded_file is None:
-    st.info("Upload a Parquet file in the sidebar to begin.")
+# Determine which file to use
+file_to_use = None
+data_source = None
+
+if st.session_state.use_sample_data:
+    # Load sample file from repository
+    sample_file_path = "adadas.parquet"
+    try:
+        with open(sample_file_path, "rb") as f:
+            file_to_use = BytesIO(f.read())
+        data_source = "sample"
+        st.sidebar.success("✓ Sample data loaded")
+    except FileNotFoundError:
+        st.sidebar.error(f"Sample file not found at {sample_file_path}")
+        st.session_state.use_sample_data = False
+elif uploaded_file is not None:
+    file_to_use = uploaded_file
+    data_source = "uploaded"
+
+if file_to_use is None:
+    st.info("👆 Upload a Parquet file in the sidebar, or click 'Load Sample Data' to try the app with the sample ADaM dataset.")
 else:
     # Load data and schema
-    file_bytes = uploaded_file.read()
+    file_bytes = file_to_use.read()
+    if data_source == "sample":
+        st.sidebar.info("ℹ️ Using sample data (adadas.parquet). You can still upload your own file above.")
+    
     full_df = load_parquet_from_bytes(file_bytes)
     schema = load_schema_from_bytes(file_bytes)
     column_metadata = extract_column_metadata(schema)
@@ -234,6 +276,7 @@ else:
 
     st.success(
         f"Loaded dataset with approximately {len(full_df):,} rows and {len(full_df.columns)} columns."
+        + (" (Sample data)" if data_source == "sample" else "")
     )
 
     # Tabs
