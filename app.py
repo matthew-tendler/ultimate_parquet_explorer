@@ -301,25 +301,97 @@ else:
     with tab_table:
         st.subheader("Table Explorer (sample)")
         st.caption(
-            "Showing a sampled subset for responsiveness. Adjust sample size in the sidebar."
+            "Showing a sampled subset for responsiveness. Adjust sample size in the sidebar. "
+            "Select specific columns below to improve readability when viewing many columns."
         )
 
-        gb = GridOptionsBuilder.from_dataframe(sample_df)
-        gb.configure_pagination(enabled=True)
-        gb.configure_side_bar()
-        gb.configure_default_column(
-            resizable=True,
-            sortable=True,
-            filter=True,
-        )
-        grid_options = gb.build()
+        # Column selection for better readability
+        if "table_selected_columns" not in st.session_state:
+            # Default to first 15 columns for readability
+            st.session_state.table_selected_columns = list(sample_df.columns)[:min(15, len(sample_df.columns))]
+        
+        col_select_col1, col_select_col2, col_select_col3 = st.columns([4, 1, 1])
+        with col_select_col1:
+            selected_columns = st.multiselect(
+                "Select columns to display (helps with readability when you have many columns)",
+                options=list(sample_df.columns),
+                default=st.session_state.table_selected_columns,
+                help="Select which columns to display in the table. This helps improve readability when you have many columns.",
+            )
+        with col_select_col2:
+            if st.button("All", use_container_width=True):
+                st.session_state.table_selected_columns = list(sample_df.columns)
+                st.rerun()
+        with col_select_col3:
+            if st.button("Reset", use_container_width=True):
+                st.session_state.table_selected_columns = list(sample_df.columns)[:min(15, len(sample_df.columns))]
+                st.rerun()
+        
+        # Update session state
+        if selected_columns != st.session_state.table_selected_columns:
+            st.session_state.table_selected_columns = selected_columns
+        
+        if not selected_columns:
+            st.info("Select at least one column to display.")
+        else:
+            display_df = sample_df[selected_columns].copy()
+            
+            # Configure AG Grid with better column sizing
+            gb = GridOptionsBuilder.from_dataframe(display_df)
+            gb.configure_pagination(
+                enabled=True,
+                paginationAutoPageSize=False,
+                paginationPageSize=50,
+            )
+            gb.configure_side_bar()
+            gb.configure_default_column(
+                resizable=True,
+                sortable=True,
+                filter=True,
+                wrapText=True,  # Enable text wrapping
+                autoHeight=True,  # Auto-adjust row height
+                minWidth=100,  # Minimum column width
+            )
+            
+            # Set better default widths for columns based on content
+            for col in display_df.columns:
+                col_type = str(display_df[col].dtype)
+                # Calculate appropriate width based on content
+                max_len = display_df[col].astype(str).str.len().max() if len(display_df) > 0 else 10
+                col_name_len = len(col)
+                
+                # Set width based on type and content
+                if 'object' in col_type or 'string' in col_type:
+                    # For text columns, use max of content length or column name, capped
+                    width = min(max(max_len * 8, col_name_len * 10, 120), 300)
+                elif 'int' in col_type or 'float' in col_type:
+                    width = max(col_name_len * 10, 100)
+                elif 'date' in col_type.lower() or 'time' in col_type.lower():
+                    width = 150
+                else:
+                    width = 120
+                
+                gb.configure_column(col, width=int(width))
+            
+            # Add column labels as tooltips
+            for col in display_df.columns:
+                meta = column_metadata.get(col, {})
+                label = meta.get("label", "")
+                if label:
+                    gb.configure_column(col, headerTooltip=f"{col}: {label}")
+            
+            grid_options = gb.build()
 
-        AgGrid(
-            sample_df,
-            gridOptions=grid_options,
-            height=500,
-            theme="streamlit",
-        )
+            AgGrid(
+                display_df,
+                gridOptions=grid_options,
+                height=600,
+                theme="streamlit",
+                allow_unsafe_jscode=True,
+                update_mode="MODEL_CHANGED",
+            )
+            
+            st.caption(f"Displaying {len(display_df):,} rows × {len(display_df.columns)} columns. Use column filters and sorting to explore the data.")
 
     # ---------------------------
     # Tab 3 - Filters (Expression-based)
